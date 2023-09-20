@@ -1,4 +1,41 @@
+#![warn(
+    clippy::all,
+    clippy::dbg_macro,
+    clippy::todo,
+    clippy::empty_enum,
+    clippy::enum_glob_use,
+    clippy::mem_forget,
+    clippy::unused_self,
+    clippy::filter_map_next,
+    clippy::needless_continue,
+    clippy::needless_borrow,
+    clippy::match_wildcard_for_single_variants,
+    clippy::if_let_mutex,
+    clippy::mismatched_target_os,
+    clippy::await_holding_lock,
+    clippy::match_on_vec_items,
+    clippy::imprecise_flops,
+    clippy::suboptimal_flops,
+    clippy::lossy_float_literal,
+    clippy::rest_pat_in_fully_bound_structs,
+    clippy::fn_params_excessive_bools,
+    clippy::exit,
+    clippy::inefficient_to_string,
+    clippy::linkedlist,
+    clippy::macro_use_imports,
+    clippy::option_option,
+    clippy::verbose_file_reads,
+    clippy::unnested_or_patterns,
+    clippy::str_to_string,
+    rust_2018_idioms,
+    future_incompatible,
+    nonstandard_style,
+    missing_debug_implementations,
+    missing_docs
+)]
+
 use proc_macro::TokenStream;
+use std::collections::HashSet;
 
 use darling::ast::NestedMeta;
 use darling::FromMeta;
@@ -13,11 +50,10 @@ mod helpers;
 #[derive(FromMeta)]
 struct MacroArgs {
     #[darling(default)]
-    name: Option<String>,
-    #[darling(default)]
     size: Option<usize>,
     ttl: Option<u64>,
     #[darling(default)]
+    // list of input names to use for the cache key
     key: Option<String>,
 
     #[darling(default)]
@@ -29,6 +65,86 @@ struct MacroArgs {
     cache_create: Option<String>,
 }
 
+/// ```ignore
+/// use cold_moka::moka::sync::Cache;
+/// use cold_moka::cached;
+/// use cold_moka::once_cell::sync::Lazy;
+///
+///
+/// #[cached(ttl = 100, size = 100)]
+/// fn foo(bar: i32) -> i32 {
+///     bar + 1
+/// }
+///
+/// fn foo(bar: i32) -> i32 {
+///     static FOO: Lazy<Cache<i32, i32>> = Lazy::new(|| {
+///         Cache::builder()
+///             .max_capacity(100)
+///             .time_to_live(std::time::Duration::from_secs(100))
+///             .build()
+///     });
+///     
+///     fn foo_inner(bar: i32) -> i32 {
+///         bar + 1
+///     }
+///
+///     FOO.get_with_by_ref(&bar, || bar + 1)
+/// }
+/// ```
+///
+/// async functions will use `moka::future::Cache` instead of `moka::sync::Cache`
+///
+/// ```ignore
+/// use cold_moka::moka::future::Cache;
+/// use cold_moka::cached;
+/// use cold_moka::once_cell::sync::Lazy;
+///
+/// #[cached(ttl = 100, size = 100)]
+/// async fn bar(arg1: i32) ->String{
+///   arg1.to_string()
+/// }
+///
+/// // becomes
+/// async fn bar(arg1: i32) ->String{
+///  static BAR: Lazy<Cache<i32, String>> = Lazy::new(|| {
+///        Cache::builder()
+///           .max_capacity(100)
+///          .time_to_live(std::time::Duration::from_secs(100))
+///         .build()
+///   });
+///  BAR.get_with_by_ref(&arg1, || arg1.to_string()).await
+/// }
+/// ```
+///
+/// for functions with multiple arguments, you can specify which arguments to use for the cache key
+///
+/// ```rust
+/// use cold_moka::cached;
+///
+/// struct Context;
+///
+/// #[cached(key = "arg1, arg2")]
+/// async fn frobnicate(ctx: Context,arg1:i32, arg2: i32) -> Result<i32, String> {
+///     Ok(arg1 + arg2)
+/// }
+/// ```
+/// functions returning `Result` or `Option` will use `try_get_with_by_ref` and `optional_get_with_by_ref` respectively  
+///
+/// ```rust
+/// use cold_moka::cached;
+/// struct Context;
+///
+/// struct Wrapper<T>(T);
+///
+/// #[cached(key = "arg1,str")]
+/// async fn frobnicate(
+///     _ctx: Context,
+///     Wrapper(arg1): Wrapper<i32> ,
+///     str: String
+/// ) -> Result<String, String> {
+///     Ok(format!("{}{}", arg1, str))
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     let attr_args = match NestedMeta::parse_meta_list(args.into()) {
@@ -57,15 +173,33 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     let output = signature.output.clone();
     let is_async = signature.asyncness.is_some();
 
-    let input_names = get_input_names(&inputs);
+    let filter_args_by: Option<HashSet<String>> = args.key.as_ref().map(|x| {
+        x.split(',')
+            .map(|x| x.trim().to_owned())
+            .collect::<HashSet<String>>()
+    });
 
-    let ty_depths_info: Vec<u8> = input_names.iter().map(|x| x.1).collect();
-    let input_names = input_names.iter().map(|x| x.0.clone()).collect();
-
+    let input_names_with_depth: Vec<_> = get_input_names(&inputs).collect();
+    let ty_depths_info: Vec<u8> = input_names_with_depth.iter().map(|x| x.1).collect();
     let input_tys = get_input_types(&inputs, &ty_depths_info);
-    let function_call_args = get_wrapped_type_for_function_call(&inputs);
+    let input_names: Vec<_> = input_names_with_depth
+        .into_iter()
+        .map(|x| x.0.clone())
+        .collect();
 
-    // println!("input_tys: {:?}", param_names(&inputs));
+    let cache_key_type_indexes: HashSet<_> = input_names
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ident)| {
+            if let Some(filter) = &filter_args_by {
+                filter.contains(ident.to_string().trim()).then_some(idx)
+            } else {
+                Some(idx)
+            }
+        })
+        .collect();
+
+    let inner_function_call_args = get_wrapped_type_for_function_call(&inputs);
 
     // pull out the output type
     let output_ty = match &output {
@@ -73,27 +207,23 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
         ReturnType::Type(_, ty) => quote! {#ty},
     };
 
-    let return_ty = return_fallible_ty(&output);
-
-    // pull out the output type
-
+    let return_ty = return_fallible_type(&output);
     let cache_value_ty = find_value_type(return_ty, &output, output_ty);
-
-    // make the cache identifier
-    let cache_ident = match args.name {
-        Some(ref name) => Ident::new(name, fn_ident.span()),
-        None => Ident::new(&fn_ident.to_string().to_uppercase(), fn_ident.span()),
-    };
+    let cache_ident = Ident::new(&fn_ident.to_string().to_uppercase(), fn_ident.span());
 
     let (cache_key_ty, key_convert_block) = make_cache_key_type(
-        &args.key,
+        &cache_key_type_indexes,
         &args.convert,
         &args.cache_type,
         input_tys,
         &input_names,
     );
 
-    let size = args.size.unwrap_or(1000);
+    let size = if inner_function_call_args.is_empty() {
+        args.size.unwrap_or(1) // () is the only possible input
+    } else {
+        args.size.unwrap_or(1000)
+    };
 
     // make the cache type and create statement
     let (cache_ty, mut cache_create) =
@@ -118,7 +248,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let function_call = inner_function_call(
-        function_call_args,
+        inner_function_call_args,
         return_ty,
         &cache_ident,
         no_cache_fn_ident,
@@ -134,7 +264,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
         {
             // inner function
             #function_no_cache
-            // static cache
+            // cache creation
             #cache_type
             let key = #key_convert_block;
             // call to inner function
@@ -165,7 +295,7 @@ fn inner_function_call(
         }
         (RetTurnTy::Result, false) => {
             quote! {
-                let result = #cache_ident.get_with_by_ref(&key, || #no_cache_fn_ident(#(#input_names),*));
+                let result = #cache_ident.try_get_with_by_ref(&key, || #no_cache_fn_ident(#(#input_names),*));
                 match result {
                     Ok(v) => v,
                     Err(e) => return Err(e.into()),
@@ -174,7 +304,7 @@ fn inner_function_call(
         }
         (RetTurnTy::Result, true) => {
             quote! {
-                let result = #cache_ident.get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await;
+                let result = #cache_ident.try_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await;
                 match result {
                     Ok(v) => v,
                     Err(e) => Err(e.into()),
@@ -183,12 +313,12 @@ fn inner_function_call(
         }
         (RetTurnTy::Option, false) => {
             quote! {
-                #cache_ident.get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*))
+                #cache_ident.optionally_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*))
             }
         }
         (RetTurnTy::Option, true) => {
             quote! {
-                #cache_ident.get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await
+                #cache_ident.optionally_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await
             }
         }
     }
@@ -241,4 +371,12 @@ fn cache_creation_statement(
         }
     };
     (cache_ty, cache_create)
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    pub fn pass() {
+        macrotest::expand("tests/*.rs");
+    }
 }

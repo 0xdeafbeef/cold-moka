@@ -1,3 +1,6 @@
+#[doc(hidden)]
 pub use moka;
-pub use moka_cached_proc::cached;
+#[doc(hidden)]
 pub use once_cell;
+
+pub use moka_cached_proc::cached;
