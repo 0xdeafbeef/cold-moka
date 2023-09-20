@@ -1,5 +1,6 @@
 use proc_macro2::{Ident, TokenStream as TokenStream2};
 use quote::{quote, ToTokens};
+use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use syn::punctuated::Punctuated;
@@ -95,7 +96,7 @@ pub enum RetTurnTy {
 }
 
 // works with Result<T>, ::std::result::Result<T>, Option<T>, ::std::option::Option<T> and type Result<T> = ::std::result::Result<T, E>;
-pub fn return_fallible_ty(output: &ReturnType) -> RetTurnTy {
+pub fn return_fallible_type(output: &ReturnType) -> RetTurnTy {
     let return_ty = match &output {
         ReturnType::Default => quote! { () },
         ReturnType::Type(_, ty) => quote! { #ty },
@@ -147,30 +148,35 @@ pub(super) fn find_value_type(
 
 // make the cache key type and block that converts the inputs into the key type
 pub(super) fn make_cache_key_type(
-    key: &Option<String>,
+    key_args_indexes: &HashSet<usize>,
     convert: &Option<String>,
     cache_type: &Option<String>,
     input_tys: Vec<Type>,
-    input_names: &Vec<Ident>,
+    input_names: &[Ident],
 ) -> (TokenStream2, TokenStream2) {
-    match (key, convert, cache_type) {
-        (Some(key_str), Some(convert_str), _) => {
-            let cache_key_ty = parse_str::<Type>(key_str).expect("unable to parse cache key type");
-
+    let input_tys: Vec<_> = input_tys
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ty)| key_args_indexes.contains(&idx).then_some(ty))
+        .collect();
+    match (convert, cache_type) {
+        (Some(convert_str), _) => {
             let key_convert_block =
                 parse_str::<Block>(convert_str).expect("unable to parse key convert block");
+            let cache_key_ty = quote! {(#(#input_tys),*)};
 
             (quote! {#cache_key_ty}, quote! {#key_convert_block})
         }
-        (None, Some(convert_str), Some(_)) => {
-            let key_convert_block =
-                parse_str::<Block>(convert_str).expect("unable to parse key convert block");
-
-            (quote! {}, quote! {#key_convert_block})
+        (None, _) => {
+            let input_names = input_names
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, ty)| key_args_indexes.contains(&idx).then_some(ty));
+            (
+                quote! {(#(#input_tys),*)},
+                quote! {(#(#input_names.clone()),*)},
+            )
         }
-        (None, None, _) => (quote! {(#(#input_tys),*)}, quote! {(#(#input_names),*)}),
-        (Some(_), None, _) => panic!("key requires convert to be set"),
-        (None, Some(_), None) => panic!("convert requires key or type to be set"),
     }
 }
 
@@ -184,14 +190,13 @@ pub(super) fn make_cache_key_type(
 // then we need to strip off the `mut` keyword from the
 // variable identifiers, so we can refer to arguments `a` and `b`
 // instead of `mut a` and `mut b`
-pub(super) fn get_input_names(inputs: &Punctuated<FnArg, Comma>) -> Vec<(Ident, u8)> {
-    inputs
-        .iter()
-        .flat_map(|input| match input {
-            FnArg::Receiver(_) => panic!("methods (functions taking 'self') are not supported"),
-            FnArg::Typed(pat_type) => param_names(*pat_type.pat.clone(), 0),
-        })
-        .collect()
+pub(super) fn get_input_names(
+    inputs: &Punctuated<FnArg, Comma>,
+) -> impl Iterator<Item = (Ident, u8)> + '_ {
+    inputs.iter().flat_map(|input| match input {
+        FnArg::Receiver(_) => panic!("methods (functions taking 'self') are not supported"),
+        FnArg::Typed(pat_type) => param_names(*pat_type.pat.clone(), 0),
+    })
 }
 
 // get types for cache key
