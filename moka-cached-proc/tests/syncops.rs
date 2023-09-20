@@ -53,3 +53,10 @@ pub fn result(inp: i32) -> Result<i32, i32> {
 fn option(inp: i32) -> Option<i32> {
     Some(inp)
 }
+
+pub struct Wrapper<T>(T);
+
+#[cached]
+fn destruct(Wrapper(aaaaaa): Wrapper<i32>) -> i32 {
+    aaaaaa
+}

@@ -1,9 +1,13 @@
-use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use proc_macro2::{Ident, TokenStream as TokenStream2};
+use quote::{quote, ToTokens};
+use std::iter;
 use std::ops::Deref;
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
-use syn::{parse_str, Block, FnArg, Pat, PatType, PathArguments, ReturnType, Signature, Type};
+use syn::{
+    parse_str, Block, FieldPat, FnArg, GenericArgument, Pat, PatIdent, PatReference, PatStruct,
+    PatTuple, PatTupleStruct, PatType, PathArguments, ReturnType, Signature, Type,
+};
 
 // if you define arguments as mutable, e.g.
 // #[cached]
@@ -25,7 +29,7 @@ pub(super) fn get_mut_signature(signature: Signature) -> Signature {
             FnArg::Receiver(_) => inp.clone(),
             FnArg::Typed(pat_type) => {
                 let mut pt = pat_type.clone();
-                let pat = match_pattern_type(&pat_type);
+                let pat = strip_mut_from_pat(pat_type);
                 pt.pat = pat;
                 FnArg::Typed(pt)
             }
@@ -36,7 +40,7 @@ pub(super) fn get_mut_signature(signature: Signature) -> Signature {
     signature_no_muts
 }
 
-pub(super) fn match_pattern_type(pat_type: &&PatType) -> Box<Pat> {
+pub(super) fn strip_mut_from_pat(pat_type: &PatType) -> Box<Pat> {
     match &pat_type.pat.deref() {
         Pat::Ident(pat_ident) => {
             if pat_ident.mutability.is_some() {
@@ -48,6 +52,38 @@ pub(super) fn match_pattern_type(pat_type: &&PatType) -> Box<Pat> {
             }
         }
         _ => pat_type.pat.clone(),
+    }
+}
+
+pub fn param_names(pat: Pat, depth: u8) -> Box<dyn Iterator<Item = (Ident, u8)>> {
+    match pat {
+        Pat::Ident(PatIdent { ident, .. }) => Box::new(iter::once((ident, depth))),
+        Pat::Reference(PatReference { pat, .. }) => param_names(*pat, depth + 1),
+        // We can't get the concrete type of fields in the struct/tuple
+        // patterns by using `syn`. e.g. `fn foo(Foo { x, y }: Foo) {}`.
+        // Therefore, the struct/tuple patterns in the arguments will just
+        // always be recorded as `RecordType::Debug`.
+        Pat::Struct(PatStruct { fields, .. }) => Box::new(
+            fields
+                .into_iter()
+                .flat_map(move |FieldPat { pat, .. }| param_names(*pat, depth + 1)),
+        ),
+        Pat::Tuple(PatTuple { elems, .. }) => Box::new(
+            elems
+                .into_iter()
+                .flat_map(move |p| param_names(p, depth + 1)),
+        ),
+        Pat::TupleStruct(PatTupleStruct { elems, .. }) => Box::new(
+            elems
+                .into_iter()
+                .flat_map(move |p| param_names(p, depth + 1)),
+        ),
+
+        // The above *should* cover all cases of irrefutable patterns,
+        // but we purposefully don't do any funny business here
+        // (such as panicking) because that would obscure rustc's
+        // much more informative error message.
+        _ => Box::new(iter::empty()),
     }
 }
 
@@ -115,7 +151,7 @@ pub(super) fn make_cache_key_type(
     convert: &Option<String>,
     cache_type: &Option<String>,
     input_tys: Vec<Type>,
-    input_names: &Vec<Pat>,
+    input_names: &Vec<Ident>,
 ) -> (TokenStream2, TokenStream2) {
     match (key, convert, cache_type) {
         (Some(key_str), Some(convert_str), _) => {
@@ -148,23 +184,74 @@ pub(super) fn make_cache_key_type(
 // then we need to strip off the `mut` keyword from the
 // variable identifiers, so we can refer to arguments `a` and `b`
 // instead of `mut a` and `mut b`
-pub(super) fn get_input_names(inputs: &Punctuated<FnArg, Comma>) -> Vec<Pat> {
+pub(super) fn get_input_names(inputs: &Punctuated<FnArg, Comma>) -> Vec<(Ident, u8)> {
     inputs
         .iter()
-        .map(|input| match input {
+        .flat_map(|input| match input {
             FnArg::Receiver(_) => panic!("methods (functions taking 'self') are not supported"),
-            FnArg::Typed(pat_type) => *match_pattern_type(&pat_type),
+            FnArg::Typed(pat_type) => param_names(*pat_type.pat.clone(), 0),
         })
         .collect()
 }
 
-// pull out the names and types of the function inputs
-pub(super) fn get_input_types(inputs: &Punctuated<FnArg, Comma>) -> Vec<Type> {
+// get types for cache key
+pub(super) fn get_input_types(
+    inputs: &Punctuated<FnArg, Comma>,
+    ty_depths_info: &[u8],
+) -> Vec<Type> {
+    inputs
+        .iter()
+        .zip(ty_depths_info.iter())
+        .map(|(input, depth)| match input {
+            FnArg::Receiver(_) => panic!("methods (functions taking 'self') are not supported"),
+            FnArg::Typed(pat_type) => ty_from_depth_info(*depth, *pat_type.ty.clone()),
+        })
+        .collect()
+}
+
+pub(super) fn ty_from_depth_info(depth: u8, ty: Type) -> Type {
+    if depth == 0 {
+        return ty;
+    }
+    if let Type::Path(p) = ty {
+        let mut segments = p.path.segments;
+        let last = segments.last_mut().unwrap();
+        if let PathArguments::AngleBracketed(brackets) = &mut last.arguments {
+            let inner_ty = brackets.args.first_mut().unwrap();
+            let inner_ty = match inner_ty {
+                GenericArgument::Type(ty) => ty.clone(),
+                _ => panic!("GenericArgument not a type"),
+            };
+            ty_from_depth_info(depth - 1, inner_ty.clone())
+        } else {
+            panic!("PathArguments not AngleBracketed")
+        }
+    } else {
+        ty
+    }
+}
+
+//creates call expression for inner function
+// eg we had fn foo(a: i32, b: i32) -> i32 { a + b }
+// then we create
+// ```rs
+// foo_inner(a, b).await
+// ```
+pub(super) fn get_wrapped_type_for_function_call(
+    inputs: &Punctuated<FnArg, Comma>,
+) -> Vec<TokenStream2> {
     inputs
         .iter()
         .map(|input| match input {
             FnArg::Receiver(_) => panic!("methods (functions taking 'self') are not supported"),
-            FnArg::Typed(pat_type) => *pat_type.ty.clone(),
+            FnArg::Typed(pat_type) => match *strip_mut_from_pat(pat_type) {
+                Pat::Ident(ident) => ident.to_token_stream(),
+                Pat::Tuple(tuple) => tuple.to_token_stream(),
+                Pat::TupleStruct(tuple_struct) => tuple_struct.to_token_stream(),
+                Pat::Struct(struct_pat) => struct_pat.to_token_stream(),
+                Pat::Reference(pat_ref) => pat_ref.to_token_stream(),
+                _ => panic!("unsupported pattern"),
+            },
         })
         .collect()
 }
