@@ -1,9 +1,12 @@
-use crate::helpers::*;
-use darling::FromMeta;
 use proc_macro::TokenStream;
+
+use darling::ast::NestedMeta;
+use darling::FromMeta;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, AttributeArgs, Ident, ItemFn, Pat, ReturnType};
+use syn::{parse_macro_input, Ident, ItemFn, ReturnType};
+
+use crate::helpers::*;
 
 mod helpers;
 
@@ -28,7 +31,12 @@ struct MacroArgs {
 
 #[proc_macro_attribute]
 pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
-    let attr_args = parse_macro_input!(args as AttributeArgs);
+    let attr_args = match NestedMeta::parse_meta_list(args.into()) {
+        Ok(v) => v,
+        Err(e) => {
+            return TokenStream::from(darling::Error::from(e).write_errors());
+        }
+    };
     let args = match MacroArgs::from_list(&attr_args) {
         Ok(v) => v,
         Err(e) => {
@@ -49,8 +57,15 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     let output = signature.output.clone();
     let is_async = signature.asyncness.is_some();
 
-    let input_tys = get_input_types(&inputs);
     let input_names = get_input_names(&inputs);
+
+    let ty_depths_info: Vec<u8> = input_names.iter().map(|x| x.1).collect();
+    let input_names = input_names.iter().map(|x| x.0.clone()).collect();
+
+    let input_tys = get_input_types(&inputs, &ty_depths_info);
+    let function_call_args = get_wrapped_type_for_function_call(&inputs);
+
+    // println!("input_tys: {:?}", param_names(&inputs));
 
     // pull out the output type
     let output_ty = match &output {
@@ -103,7 +118,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let function_call = inner_function_call(
-        input_names,
+        function_call_args,
         return_ty,
         &cache_ident,
         no_cache_fn_ident,
@@ -131,7 +146,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn inner_function_call(
-    input_names: Vec<Pat>,
+    input_names: Vec<TokenStream2>,
     return_ty: RetTurnTy,
     cache_ident: &Ident,
     no_cache_fn_ident: Ident,

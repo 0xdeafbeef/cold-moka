@@ -3,8 +3,7 @@ fn main() {}
 
 #[cached]
 pub async fn cached() -> i32 {
-    let x = 1 + 2;
-    x
+    1 + 2
 }
 
 #[cached]
@@ -52,4 +51,11 @@ pub async fn result(inp: i32) -> Result<i32, i32> {
 #[cached]
 async fn option(inp: i32) -> Option<i32> {
     Some(inp)
+}
+
+pub struct Wrapper<T>(T);
+
+#[cached]
+async fn destruct(Wrapper(aaaaaa): Wrapper<i32>) -> i32 {
+    aaaaaa
 }
