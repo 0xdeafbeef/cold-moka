@@ -297,7 +297,7 @@ fn inner_function_call(
             quote! {
                 let result = #cache_ident.try_get_with_by_ref(&key, || #no_cache_fn_ident(#(#input_names),*));
                 match result {
-                    Ok(v) => v,
+                    Ok(v) => Ok(v),
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -306,7 +306,7 @@ fn inner_function_call(
             quote! {
                 let result = #cache_ident.try_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await;
                 match result {
-                    Ok(v) => v,
+                    Ok(v) => Ok(v),
                     Err(e) => Err(e.into()),
                 }
             }
