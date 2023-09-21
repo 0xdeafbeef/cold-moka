@@ -101,11 +101,12 @@ pub fn return_fallible_type(output: &ReturnType) -> RetTurnTy {
         ReturnType::Default => quote! { () },
         ReturnType::Type(_, ty) => quote! { #ty },
     }
-    .to_string();
+    .to_string()
+    .to_lowercase();
 
-    if return_ty == "Result" {
+    if return_ty.contains("result") {
         RetTurnTy::Result
-    } else if return_ty == "Option" {
+    } else if return_ty.contains("option") {
         RetTurnTy::Option
     } else {
         RetTurnTy::Bare
