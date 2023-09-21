@@ -1,4 +1,5 @@
 use cold_moka::cached;
+use std::sync::Arc;
 fn main() {}
 
 #[cached]
@@ -43,7 +44,7 @@ pub async fn cached6(mut i8: i8, _ctx: NoHash) -> i32 {
     x as i32
 }
 
-#[cached]
+#[cached(ret = "Result<i32, Arc<i32>>")]
 pub async fn result(inp: i32) -> Result<i32, i32> {
     Ok(inp)
 }
