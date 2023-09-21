@@ -63,9 +63,6 @@ struct MacroArgs {
     cache_type: Option<String>,
     #[darling(default, rename = "create")]
     cache_create: Option<String>,
-
-    #[darling(default, rename = "ret")]
-    res_ty: Option<String>,
 }
 
 /// ```ignore
@@ -123,25 +120,23 @@ struct MacroArgs {
 ///
 /// ```rust
 /// use cold_moka::cached;
-/// use std::sync::Arc;
 ///
 /// struct Context;
 ///
-/// #[cached(key = "arg1, arg2", ret = "Result<i32, Arc<String>>")]
+/// #[cached(key = "arg1, arg2")]
 /// async fn frobnicate(ctx: Context,arg1:i32, arg2: i32) -> Result<i32, String> {
 ///     Ok(arg1 + arg2)
 /// }
 /// ```
-/// functions returning `Result` or `Option` will use `try_get_with_by_ref` and `optional_get_with_by_ref` respectively, so you should use `ret` attribute to specify the return type and wrap the error type in `Arc`
+/// functions returning `Result` or `Option` will use `try_get_with_by_ref` and `optional_get_with_by_ref` respectively  
 ///
 /// ```rust
-/// use std::sync::Arc;
 /// use cold_moka::cached;
 /// struct Context;
 ///
 /// struct Wrapper<T>(T);
 ///
-/// #[cached(key = "arg1,str", ret ="Result<String, Arc<String>>")]
+/// #[cached(key = "arg1,str")]
 /// async fn frobnicate(
 ///     _ctx: Context,
 ///     Wrapper(arg1): Wrapper<i32> ,
@@ -213,22 +208,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let return_ty = return_fallible_type(&output);
-    let cache_value_ty = find_value_type(return_ty, &output, output_ty.clone());
-
-    let output_ty = match return_ty {
-        RetTurnTy::Bare | RetTurnTy::Option => output.clone(),
-        RetTurnTy::Result => {
-            let res_ty = args
-                .res_ty
-                .clone()
-                .expect("`ret` should be set for failiable functions. `#[cached(ret = \"Result<T, Arc<YourError>>\"`]");
-            let res_ty = format!("-> {}", res_ty);
-            syn::parse_str::<syn::ReturnType>(&res_ty).expect(
-                "unable to parse `ret` attribute. `#[cached(ret = \"Result<T, Arc<YourError>>\"`]",
-            )
-        }
-    };
-
+    let cache_value_ty = find_value_type(return_ty, &output, output_ty);
     let cache_ident = Ident::new(&fn_ident.to_string().to_uppercase(), fn_ident.span());
 
     let (cache_key_ty, key_convert_block) = make_cache_key_type(
@@ -275,8 +255,7 @@ pub fn cached(args: TokenStream, input: TokenStream) -> TokenStream {
         is_async,
     );
 
-    let mut signature = get_mut_signature(signature);
-    signature.output = output_ty;
+    let signature = get_mut_signature(signature);
     let expanded = quote!(
         #(#attributes)*
         #visibility
@@ -316,12 +295,20 @@ fn inner_function_call(
         }
         (RetTurnTy::Result, false) => {
             quote! {
-                #cache_ident.try_get_with_by_ref(&key, || #no_cache_fn_ident(#(#input_names),*))
+                let result = #cache_ident.try_get_with_by_ref(&key, || #no_cache_fn_ident(#(#input_names),*));
+                match result {
+                    Ok(v) => v,
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         (RetTurnTy::Result, true) => {
             quote! {
-                #cache_ident.try_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await
+                let result = #cache_ident.try_get_with_by_ref(&key, #no_cache_fn_ident(#(#input_names),*)).await;
+                match result {
+                    Ok(v) => v,
+                    Err(e) => Err(e.into()),
+                }
             }
         }
         (RetTurnTy::Option, false) => {
@@ -390,15 +377,6 @@ fn cache_creation_statement(
 mod test {
     #[test]
     pub fn pass() {
-        macrotest::expand("tests/asyncops.rs");
-        macrotest::expand("tests/syncops.rs");
-    }
-
-    use cold_moka::cached;
-    use std::sync::Arc;
-
-    #[cached(ret = "Result<i32, Arc<i32>>")]
-    pub async fn result(inp: i32) -> Result<i32, i32> {
-        Ok(inp)
+        macrotest::expand("tests/*.rs");
     }
 }
